@@ -1,0 +1,22 @@
+To complete the README banner image:
+
+1. Make sure both services are running:
+      uvicorn src.api.main:app --port 8000
+      streamlit run app/streamlit_app.py --server.port 8501
+
+2. Open http://localhost:8501 in your browser.
+
+3. Navigate to the "Trend Analysis" page.
+
+4. Take a full-page screenshot of the chart + trend badge + narrative summary.
+
+5. Save the file as:
+      assets/demo.png
+
+The README.md already references this path:
+      ![Dashboard](assets/demo.png)
+
+Once saved, the image will render on:
+  - GitHub repository page
+  - HuggingFace Spaces README
+  - Any markdown preview
