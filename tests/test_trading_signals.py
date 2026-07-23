@@ -254,6 +254,42 @@ class TestScoreSignalIsADeterministicRule:
         assert "volume" not in without_spike[2].lower()
         assert "volume" in with_spike[2].lower()
 
+    def test_macd_and_ma_agreement_alone_is_enough_to_buy(self):
+        # Regression test for a real bug: net is always even (rsi_vote is
+        # 0/±2, macd_vote+ma_vote is always -2/0/+2), so a threshold of 3
+        # could only ever be crossed by |net|=4 (all three indicators
+        # unanimous) -- net=2 (e.g. neutral RSI, MACD+MA agreeing) was
+        # silently forced to HOLD even though two of three indicators
+        # agreed. This is the exact combination that made real scans come
+        # back all-HOLD: most symbols at any given moment have a neutral
+        # RSI, so BUY/SELL effectively never fired.
+        signal, confidence, _ = ts._score_signal(50.0, "bullish", "golden_cross", None)
+        assert signal == "BUY"
+        assert confidence == 50.0
+
+    def test_macd_and_ma_agreement_alone_is_enough_to_sell(self):
+        signal, confidence, _ = ts._score_signal(50.0, "bearish", "death_cross", None)
+        assert signal == "SELL"
+        assert confidence == 50.0
+
+    def test_unanimous_agreement_still_scores_full_confidence(self):
+        signal, confidence, _ = ts._score_signal(20.0, "bullish", "golden_cross", None)
+        assert signal == "BUY"
+        assert confidence == 100.0
+
+    def test_neutral_rsi_reason_still_reports_the_real_value(self):
+        # Regression test for a real bug: the reason string only mentioned
+        # RSI when it was oversold/overbought, so every neutral-RSI symbol
+        # (the common case) collapsed onto one of just 4 template strings
+        # (bullish/bearish x golden/death cross) regardless of its actual
+        # RSI value -- looking identical across dozens of real, different
+        # symbols even though the underlying numbers genuinely differed.
+        _, _, reason_a = ts._score_signal(45.0, "bullish", "golden_cross", None)
+        _, _, reason_b = ts._score_signal(55.0, "bullish", "golden_cross", None)
+        assert "45.0" in reason_a
+        assert "55.0" in reason_b
+        assert reason_a != reason_b
+
 
 # ---------------------------------------------------------------------------
 # scan_signals — real small batch
