@@ -45,7 +45,23 @@ _RSI_WEIGHT = 2
 _MACD_WEIGHT = 1
 _MA_WEIGHT = 1
 _MAX_SCORE = _RSI_WEIGHT + _MACD_WEIGHT + _MA_WEIGHT
-_STRONG_THRESHOLD = 3  # |net| >= 3 -> BUY/SELL; otherwise HOLD
+
+# |net| >= 2 -> BUY/SELL; otherwise HOLD.
+#
+# Must be even, not odd: rsi_vote is always 0 or ±2 (even), and
+# macd_vote + ma_vote is always -2, 0, or +2 (sum of two ±1's is always
+# even) — so net = rsi_vote + macd_vote + ma_vote is *always* even,
+# landing in {-4, -2, 0, 2, 4}. A threshold of 3 (the original value
+# here) sits between the achievable 2 and 4, so in practice it could
+# only ever be crossed by |net| = 4 — i.e. it silently demanded all
+# three indicators unanimously agree before calling BUY/SELL, not "RSI
+# extreme plus one confirming indicator" as the weights above intend.
+# That confluence is rare enough that real scans came back all-HOLD.
+# Threshold = 2 restores the intended rule: an RSI extreme alone (if
+# MACD/MA cancel out), or MACD+MA agreeing even without an RSI extreme,
+# is enough to call a direction; full 3-way agreement (|net| = 4) still
+# scores the maximum 100% confidence.
+_STRONG_THRESHOLD = 2
 
 MIN_DAILY_HISTORY_POINTS = MA_LONG + MACD_SLOW  # enough for MA50 and MACD(26) to be past warmup
 
@@ -337,6 +353,12 @@ def _score_signal(
         reasons.append(f"RSI overbought ({rsi_14d:.1f})")
     else:
         rsi_vote = 0
+        # Still report the real RSI reading even when it's not extreme —
+        # otherwise every neutral-RSI symbol collapses onto one of only 4
+        # template strings (bullish/bearish x golden/death cross), which
+        # looks identical across dozens of genuinely different symbols
+        # even though their actual RSI values differ.
+        reasons.append(f"RSI neutral ({rsi_14d:.1f})")
 
     macd_vote = _MACD_WEIGHT if macd_trend == "bullish" else -_MACD_WEIGHT
     reasons.append(f"{macd_trend} MACD crossover")
