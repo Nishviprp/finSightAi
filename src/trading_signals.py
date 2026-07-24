@@ -95,6 +95,44 @@ def calculate_ema(prices, period: int) -> pd.Series:
     return _as_series(prices).ewm(span=period, adjust=False).mean()
 
 
+def calculate_rsi_series(prices, period: int = RSI_LENGTH) -> pd.Series:
+    """
+    Full Wilder's RSI series, aligned index-for-index to *prices* (not just
+    the latest value — calculate_rsi() below is now a thin wrapper around
+    this). Needed by calculate_stochastic_rsi() (StochRSI is literally the
+    Stochastic oscillator applied to a rolling window of RSI *values*, not
+    price) and by the backtest engine, which computes every indicator once,
+    vectorized, over the whole history rather than recomputing from scratch
+    at each historical day.
+
+    Every value at row i depends only on rows <= i (Wilder's recursion is
+    inherently causal) — safe to use directly in a no-look-ahead backtest.
+
+    Leading entries are NaN until *period* + 1 real price points have
+    accumulated, same warmup as the scalar calculate_rsi().
+    """
+    series = _as_series(prices)
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.rolling(window=period).mean()
+    avg_loss = loss.rolling(window=period).mean()
+    # avg_gain/avg_loss are NaN until index `period` (delta's own index 0 is
+    # itself NaN, so the first fully-populated `period`-window average
+    # lands at index `period`, not `period - 1`).
+    for i in range(period + 1, len(series)):
+        if pd.isna(avg_gain.iloc[i - 1]):
+            continue
+        avg_gain.iloc[i] = (avg_gain.iloc[i - 1] * (period - 1) + gain.iloc[i]) / period
+        avg_loss.iloc[i] = (avg_loss.iloc[i - 1] * (period - 1) + loss.iloc[i]) / period
+
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    rsi[avg_loss == 0] = 100.0
+    return rsi
+
+
 def calculate_rsi(prices, period: int = RSI_LENGTH) -> Optional[float]:
     """
     Wilder's RSI: the original, textbook formula — average gain/loss over
@@ -113,25 +151,77 @@ def calculate_rsi(prices, period: int = RSI_LENGTH) -> Optional[float]:
     if len(series) < period + 1:
         return None
 
-    delta = series.diff().dropna()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
+    latest = calculate_rsi_series(series, period).iloc[-1]
+    return None if pd.isna(latest) else float(latest)
 
-    avg_gain = gain.rolling(window=period).mean()
-    avg_loss = loss.rolling(window=period).mean()
-    for i in range(period, len(gain)):
-        avg_gain.iloc[i] = (avg_gain.iloc[i - 1] * (period - 1) + gain.iloc[i]) / period
-        avg_loss.iloc[i] = (avg_loss.iloc[i - 1] * (period - 1) + loss.iloc[i]) / period
 
-    latest_gain = avg_gain.iloc[-1]
-    latest_loss = avg_loss.iloc[-1]
-    if pd.isna(latest_gain) or pd.isna(latest_loss):
-        return None
-    if latest_loss == 0:
-        return 100.0
+def calculate_bollinger_bands(
+    prices, period: int = 20, num_std: float = 2.0
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """
+    Bollinger Bands: a *period*-bar SMA (the middle band) plus/minus
+    *num_std* rolling standard deviations.
 
-    rs = latest_gain / latest_loss
-    return float(100 - (100 / (1 + rs)))
+    Returns (upper, middle, lower) as three Series aligned to *prices*.
+    Leading `period - 1` entries are NaN.
+    """
+    series = _as_series(prices)
+    middle = calculate_sma(series, period)
+    std = series.rolling(window=period).std()
+    upper = middle + num_std * std
+    lower = middle - num_std * std
+    return upper, middle, lower
+
+
+def calculate_stochastic_rsi(
+    prices,
+    rsi_period: int = RSI_LENGTH,
+    stoch_period: int = 14,
+    k_smooth: int = 3,
+    d_smooth: int = 3,
+) -> tuple[pd.Series, pd.Series]:
+    """
+    Stochastic RSI: the Stochastic oscillator's %K/%D formula applied to a
+    rolling window of RSI *values* (not price) — distinct from, and more
+    sensitive than, the plain price-based Stochastic oscillator.
+
+    %K (raw) = (RSI - rolling_min(RSI, stoch_period)) /
+               (rolling_max(RSI, stoch_period) - rolling_min(RSI, stoch_period)) * 100,
+    then %K = SMA(%K_raw, k_smooth) and %D = SMA(%K, d_smooth) — standard
+    smoothing (defaults 3/3) so %K/%D aren't too noisy to cross meaningfully.
+
+    Returns (%K, %D) as two Series aligned to *prices*.
+    """
+    rsi = calculate_rsi_series(prices, rsi_period)
+    rsi_min = rsi.rolling(window=stoch_period).min()
+    rsi_max = rsi.rolling(window=stoch_period).max()
+    span = (rsi_max - rsi_min).replace(0, float("nan"))  # flat RSI window -> undefined, not divide-by-zero
+    stoch_rsi_raw = (rsi - rsi_min) / span * 100
+
+    k = stoch_rsi_raw.rolling(window=k_smooth).mean()
+    d = k.rolling(window=d_smooth).mean()
+    return k, d
+
+
+def calculate_volume_ratio_series(volume, period: int = VOLUME_LOOKBACK) -> pd.Series:
+    """Latest volume / trailing *period*-bar average volume, as a full
+    series aligned to *volume* — the series form of the volume_ratio field
+    _compute_daily_indicators() already returns as a scalar."""
+    series = _as_series(volume)
+    avg_volume = series.rolling(window=period).mean()
+    return series / avg_volume
+
+
+def _crossed_above(a: pd.Series, b: pd.Series) -> pd.Series:
+    """True at index i iff *a* was <= *b* at i-1 and is > *b* at i — a
+    fresh upward crossing, not just "currently above" (which would also
+    flag every day *after* an old crossover, not the crossover event
+    itself)."""
+    return (a > b) & (a.shift(1) <= b.shift(1))
+
+
+def _crossed_below(a: pd.Series, b: pd.Series) -> pd.Series:
+    return (a < b) & (a.shift(1) >= b.shift(1))
 
 
 def calculate_macd(
@@ -159,6 +249,270 @@ def calculate_macd(
         return None
 
     return float(latest_macd), float(latest_signal), float(latest_hist)
+
+
+# ---------------------------------------------------------------------------
+# Ensemble voting system — a second, independent signal alongside the
+# classic RSI/MACD/MA one above (calculate_signals() / scan_signals() are
+# untouched; this is calculate_signals_ensemble() / scan_signals_ensemble()).
+#
+# Four indicators vote, each contributing at most one point toward BUY and
+# one toward SELL for a given day:
+#   - RSI(14) < 35 (oversold)                       -> BUY vote
+#     RSI(14) > 65 (overbought)                      -> SELL vote
+#   - Close below the lower Bollinger Band            -> BUY vote
+#     Close above the upper Bollinger Band            -> SELL vote
+#   - Stochastic RSI %K crosses above %D              -> BUY vote
+#     Stochastic RSI %K crosses below %D              -> SELL vote
+#   - Volume spike (>= 2x the 20-day average)          -> BUY *and* SELL vote
+#     (a volume spike has no direction of its own — it's a conviction
+#     multiplier that confirms whichever move is already happening, exactly
+#     as the task spec lists it identically in both the BUY and SELL
+#     condition sets)
+# BUY fires when buy_votes >= threshold; SELL when sell_votes >= threshold;
+# otherwise HOLD. Each indicator's own buy/sell pair is mutually exclusive
+# (RSI can't be simultaneously <35 and >65, etc.), but the four indicators
+# are computed independently of each other and can genuinely disagree —
+# e.g. RSI and Bollinger Bands both read overbought while Stochastic RSI
+# flashes a bullish crossover the same day (a real pattern seen in the
+# backtest below, not a hypothetical). So buy_votes and sell_votes *can*
+# both reach the threshold on the same day; the tie-break here (higher
+# vote count wins, BUY wins an exact tie) is a real, reachable code path.
+#
+# EMA(12) vs EMA(26) crossover is also computed and reported (per the task's
+# Step 1 ask to add it) but is deliberately NOT part of the vote tally —
+# the task's own Step 2 vote list names only the four indicators above. Its
+# standalone predictive value is evaluated separately by the backtest
+# engine's indicator-importance report.
+# ---------------------------------------------------------------------------
+
+ENSEMBLE_RSI_OVERSOLD = 35
+ENSEMBLE_RSI_OVERBOUGHT = 65
+BB_PERIOD = 20
+BB_NUM_STD = 2.0
+STOCH_PERIOD = 14
+STOCH_K_SMOOTH = 3
+STOCH_D_SMOOTH = 3
+ENSEMBLE_EMA_FAST, ENSEMBLE_EMA_SLOW = 12, 26
+ENSEMBLE_VOTE_THRESHOLD = 3  # default; the backtest also sweeps 2 and 4
+ENSEMBLE_MAX_VOTES = 4
+
+ENSEMBLE_MIN_HISTORY_POINTS = max(BB_PERIOD, STOCH_PERIOD * 2 + STOCH_K_SMOOTH + STOCH_D_SMOOTH, ENSEMBLE_EMA_SLOW) + 10
+
+
+def _compute_ensemble_indicators(daily: pd.DataFrame) -> Optional[pd.DataFrame]:
+    """
+    Every ensemble indicator and vote, computed once, vectorized, over the
+    *entire* history in *daily* — aligned index-for-index to it. Every
+    column's value at row i depends only on rows <= i (Bollinger Bands,
+    StochRSI, EMA and the rolling volume average are all inherently
+    causal/trailing), which is what makes this table safe to reuse as-is
+    for both the live "latest row" signal (calculate_signals_ensemble) and
+    the backtest engine (which walks every historical row and must never
+    peek ahead).
+
+    Returns None if *daily* is missing required OHLCV columns.
+    """
+    try:
+        close, high, low, volume = daily["Close"], daily["High"], daily["Low"], daily["Volume"]
+    except KeyError as exc:
+        logger.warning("Ensemble indicators missing required column: %s", exc)
+        return None
+
+    rsi = calculate_rsi_series(close, RSI_LENGTH)
+    upper_bb, middle_bb, lower_bb = calculate_bollinger_bands(close, BB_PERIOD, BB_NUM_STD)
+    stoch_k, stoch_d = calculate_stochastic_rsi(close, RSI_LENGTH, STOCH_PERIOD, STOCH_K_SMOOTH, STOCH_D_SMOOTH)
+    volume_ratio = calculate_volume_ratio_series(volume, VOLUME_LOOKBACK)
+    ema_fast = calculate_ema(close, ENSEMBLE_EMA_FAST)
+    ema_slow = calculate_ema(close, ENSEMBLE_EMA_SLOW)
+
+    buy_rsi = rsi < ENSEMBLE_RSI_OVERSOLD
+    sell_rsi = rsi > ENSEMBLE_RSI_OVERBOUGHT
+    buy_bb = close < lower_bb
+    sell_bb = close > upper_bb
+    stoch_bull_cross = _crossed_above(stoch_k, stoch_d)
+    stoch_bear_cross = _crossed_below(stoch_k, stoch_d)
+    volume_spike = volume_ratio >= VOLUME_SPIKE_RATIO
+
+    buy_votes = buy_rsi.astype(int) + buy_bb.astype(int) + stoch_bull_cross.astype(int) + volume_spike.astype(int)
+    sell_votes = sell_rsi.astype(int) + sell_bb.astype(int) + stoch_bear_cross.astype(int) + volume_spike.astype(int)
+
+    return pd.DataFrame(
+        {
+            "close": close,
+            "rsi": rsi,
+            "upper_bb": upper_bb,
+            "middle_bb": middle_bb,
+            "lower_bb": lower_bb,
+            "stoch_k": stoch_k,
+            "stoch_d": stoch_d,
+            "volume_ratio": volume_ratio,
+            "ema_fast": ema_fast,
+            "ema_slow": ema_slow,
+            "ema_bullish": ema_fast > ema_slow,
+            "buy_rsi": buy_rsi,
+            "sell_rsi": sell_rsi,
+            "buy_bb": buy_bb,
+            "sell_bb": sell_bb,
+            "stoch_bull_cross": stoch_bull_cross,
+            "stoch_bear_cross": stoch_bear_cross,
+            "volume_spike": volume_spike,
+            "buy_votes": buy_votes,
+            "sell_votes": sell_votes,
+        }
+    )
+
+
+def _ensemble_signal_from_votes(buy_votes: int, sell_votes: int, threshold: int) -> tuple[str, float]:
+    """Returns (signal, confidence 0-100). confidence is the winning side's
+    vote count as a percentage of ENSEMBLE_MAX_VOTES — analogous to the
+    classic system's confidence, not a backtested probability."""
+    if buy_votes >= threshold and buy_votes >= sell_votes:
+        return "BUY", round(buy_votes / ENSEMBLE_MAX_VOTES * 100, 1)
+    if sell_votes >= threshold and sell_votes > buy_votes:
+        return "SELL", round(sell_votes / ENSEMBLE_MAX_VOTES * 100, 1)
+    return "HOLD", round(max(buy_votes, sell_votes) / ENSEMBLE_MAX_VOTES * 100, 1)
+
+
+def _build_ensemble_reason(row: pd.Series) -> str:
+    parts: list[str] = []
+    if row["buy_rsi"]:
+        parts.append(f"RSI oversold ({row['rsi']:.1f})")
+    elif row["sell_rsi"]:
+        parts.append(f"RSI overbought ({row['rsi']:.1f})")
+    else:
+        parts.append(f"RSI neutral ({row['rsi']:.1f})")
+
+    if row["buy_bb"]:
+        parts.append("price below lower Bollinger Band")
+    elif row["sell_bb"]:
+        parts.append("price above upper Bollinger Band")
+    else:
+        parts.append("price within Bollinger Bands")
+
+    if row["stoch_bull_cross"]:
+        parts.append("StochRSI bullish crossover")
+    elif row["stoch_bear_cross"]:
+        parts.append("StochRSI bearish crossover")
+    else:
+        parts.append(f"StochRSI no fresh crossover (K={row['stoch_k']:.1f}, D={row['stoch_d']:.1f})")
+
+    if row["volume_spike"]:
+        parts.append(f"volume spike ({row['volume_ratio']:.1f}x average)")
+
+    parts.append(f"EMA12/26 trend: {'bullish' if row['ema_bullish'] else 'bearish'} (not voted)")
+
+    return " + ".join(parts)
+
+
+@st.cache_data(ttl=14400, show_spinner=False)
+def calculate_signals_ensemble(symbol: str, threshold: int = ENSEMBLE_VOTE_THRESHOLD) -> Optional[dict]:
+    """
+    Compute the ensemble-vote signal for *symbol* — RSI + Bollinger Bands +
+    Stochastic RSI + volume spike, see the module-level comment above for
+    the exact voting rule. Independent of calculate_signals(); does not
+    affect it.
+
+    Returns a dict: symbol, name, price, signal, confidence, buy_votes,
+    sell_votes, rsi_14d, bollinger_upper, bollinger_lower, stoch_k, stoch_d,
+    volume_ratio, ema_trend ("bullish"|"bearish", informational only, not
+    voted), reason.
+
+    Returns None on any failure (invalid symbol, network error, insufficient
+    history) — never raises.
+    """
+    try:
+        daily = _fetch_daily_ohlcv(symbol)
+        if daily is None or len(daily) < ENSEMBLE_MIN_HISTORY_POINTS:
+            logger.warning("Not enough daily history for %s to compute ensemble signal", symbol)
+            return None
+
+        indicators = _compute_ensemble_indicators(daily)
+        if indicators is None or indicators.empty:
+            return None
+
+        last = indicators.iloc[-1]
+        if pd.isna(last["rsi"]) or pd.isna(last["stoch_k"]) or pd.isna(last["upper_bb"]):
+            return None
+
+        signal, confidence = _ensemble_signal_from_votes(int(last["buy_votes"]), int(last["sell_votes"]), threshold)
+
+        return {
+            "symbol": symbol.upper(),
+            "name": _resolve_name(symbol),
+            "price": float(last["close"]),
+            "signal": signal,
+            "confidence": confidence,
+            "buy_votes": int(last["buy_votes"]),
+            "sell_votes": int(last["sell_votes"]),
+            "rsi_14d": float(last["rsi"]),
+            "bollinger_upper": float(last["upper_bb"]),
+            "bollinger_lower": float(last["lower_bb"]),
+            "stoch_k": float(last["stoch_k"]),
+            "stoch_d": float(last["stoch_d"]),
+            "volume_ratio": float(last["volume_ratio"]) if not pd.isna(last["volume_ratio"]) else None,
+            "ema_trend": "bullish" if bool(last["ema_bullish"]) else "bearish",
+            "reason": _build_ensemble_reason(last),
+        }
+    except Exception as exc:
+        logger.warning("calculate_signals_ensemble failed for %s: %s", symbol, exc)
+        return None
+
+
+@st.cache_data(ttl=14400, show_spinner=False)
+def scan_signals_ensemble(
+    symbols: tuple[str, ...], threshold: int = ENSEMBLE_VOTE_THRESHOLD, _names: Optional[dict[str, str]] = None
+) -> list[dict]:
+    """
+    Ensemble-vote analog of scan_signals(): one batched daily-OHLCV download
+    for all *symbols*, same schema as calculate_signals_ensemble() per row,
+    sorted by confidence descending. Symbols that fail to resolve are
+    omitted, not a hard failure of the whole scan.
+    """
+    if not symbols:
+        return []
+
+    names = _names or {}
+    daily_batch = _fetch_daily_ohlcv_batch(symbols)
+
+    rows: list[dict] = []
+    for symbol in symbols:
+        daily = daily_batch.get(symbol)
+        if daily is None or len(daily) < ENSEMBLE_MIN_HISTORY_POINTS:
+            continue
+
+        indicators = _compute_ensemble_indicators(daily)
+        if indicators is None or indicators.empty:
+            continue
+
+        last = indicators.iloc[-1]
+        if pd.isna(last["rsi"]) or pd.isna(last["stoch_k"]) or pd.isna(last["upper_bb"]):
+            continue
+
+        signal, confidence = _ensemble_signal_from_votes(int(last["buy_votes"]), int(last["sell_votes"]), threshold)
+
+        rows.append(
+            {
+                "symbol": symbol.upper(),
+                "name": names.get(symbol, symbol.upper()),
+                "price": float(last["close"]),
+                "signal": signal,
+                "confidence": confidence,
+                "buy_votes": int(last["buy_votes"]),
+                "sell_votes": int(last["sell_votes"]),
+                "rsi_14d": float(last["rsi"]),
+                "bollinger_upper": float(last["upper_bb"]),
+                "bollinger_lower": float(last["lower_bb"]),
+                "stoch_k": float(last["stoch_k"]),
+                "stoch_d": float(last["stoch_d"]),
+                "volume_ratio": float(last["volume_ratio"]) if not pd.isna(last["volume_ratio"]) else None,
+                "ema_trend": "bullish" if bool(last["ema_bullish"]) else "bearish",
+                "reason": _build_ensemble_reason(last),
+            }
+        )
+
+    rows.sort(key=lambda r: r["confidence"], reverse=True)
+    return rows
 
 
 @st.cache_data(ttl=14400, show_spinner=False)
@@ -335,6 +689,43 @@ def _compute_daily_indicators(daily: pd.DataFrame) -> Optional[dict]:
     except Exception as exc:
         logger.warning("Indicator computation failed: %s", exc)
         return None
+
+
+def _compute_classic_indicators_series(daily: pd.DataFrame) -> Optional[pd.DataFrame]:
+    """
+    Full-history, index-aligned version of _compute_daily_indicators() above
+    — same three indicators (RSI, MACD, MA20/50 crossover), same causal
+    (no-look-ahead) computation, but every row instead of just the latest
+    one. Exists solely so the backtest engine can grade the *classic*
+    calculate_signals()/_score_signal() system with the exact same
+    day-by-day methodology used for the ensemble system, for an apples-to-
+    apples before/after comparison — calculate_signals() itself is
+    untouched and doesn't use this.
+    """
+    try:
+        close, volume = daily["Close"], daily["Volume"]
+    except KeyError as exc:
+        logger.warning("Classic indicator series missing required column: %s", exc)
+        return None
+
+    rsi = calculate_rsi_series(close, RSI_LENGTH)
+    macd_line = calculate_ema(close, MACD_FAST) - calculate_ema(close, MACD_SLOW)
+    macd_signal_line = calculate_ema(macd_line, MACD_SIGNAL)
+    ma_short = calculate_sma(close, MA_SHORT)
+    ma_long = calculate_sma(close, MA_LONG)
+    avg_volume = volume.rolling(VOLUME_LOOKBACK).mean()
+    volume_ratio = volume / avg_volume
+
+    return pd.DataFrame(
+        {
+            "close": close,
+            "rsi_14d": rsi,
+            "macd_trend": ("bullish" if v else "bearish" for v in (macd_line > macd_signal_line)),
+            "ma_crossover": ("golden_cross" if v else "death_cross" for v in (ma_short > ma_long)),
+            "volume_ratio": volume_ratio,
+            "_valid": rsi.notna() & macd_line.notna() & macd_signal_line.notna() & ma_short.notna() & ma_long.notna(),
+        }
+    )
 
 
 def _score_signal(
